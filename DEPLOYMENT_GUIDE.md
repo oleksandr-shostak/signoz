@@ -90,8 +90,7 @@ Windows Hosts → OpenTelemetry Collector → ClickHouse → AI Analyzer → Kee
 ### Files Needed
 
 From this repository:
-- `analyzer_fixed.py` - Main analyzer service
-- `deploy-log-analyzer.sh` - Deployment script
+- `deploy-log-analyzer.sh` - Automated deployment script (contains all code)
 
 ---
 
@@ -218,8 +217,8 @@ Format your response as JSON with this structure:
 ### 2.2 Deploy the Analyzer Service
 
 ```bash
-# Copy files to server
-scp analyzer_fixed.py deploy-log-analyzer.sh root@your-server:/tmp/
+# Copy deployment script to server
+scp deploy-log-analyzer.sh root@your-server:/tmp/
 
 # SSH to server
 ssh root@your-server
@@ -424,7 +423,7 @@ sudo journalctl -u log-analyzer.service -n 50
 # Common errors:
 # "Invalid prompt ID" → Verify prompt ID in OpenAI dashboard
 # "API key invalid" → Check OPENAI_API_KEY in .env
-# "Input must contain 'json'" → Already fixed in analyzer_fixed.py
+# "Input must contain 'json'" → Already fixed in deployment script
 ```
 
 **Fix:**
@@ -466,7 +465,7 @@ systemctl list-timers log-analyzer.timer
 
 #### Issue: Logs Truncated
 
-Already fixed in `analyzer_fixed.py` - logs are limited to:
+Already fixed in the deployment script - logs are limited to:
 - 2000 characters per log body
 - 120,000 total characters per analysis
 - Truncation notice added if logs exceed limits
@@ -499,13 +498,14 @@ python3 analyzer.py
 ### Update Analyzer
 
 ```bash
-# Copy new version
-scp analyzer_fixed.py root@your-server:/tmp/
+# Copy updated deployment script
+scp deploy-log-analyzer.sh root@your-server:/tmp/
 
-# SSH and update
+# SSH and re-run deployment (it will preserve your .env)
 ssh root@your-server
-sudo cp /tmp/analyzer_fixed.py /opt/log-analyzer/analyzer.py
-sudo systemctl restart log-analyzer.service
+sudo bash /tmp/deploy-log-analyzer.sh
+# When prompted, choose to keep existing .env configuration
+# The script will update the analyzer code automatically
 ```
 
 ### Update Configuration
@@ -581,7 +581,7 @@ With default settings (10-minute intervals, ~45 logs per run):
 - Service runs as root (required for systemd timer)
 - Debug files in `/opt/log-analyzer/` (owner-only access)
 - Logs are stored by OpenAI with `store=True` for platform visibility
-- Set `store=False` in `analyzer_fixed.py` for zero data retention
+- To disable storage, edit `/opt/log-analyzer/analyzer.py` and change `store=True` to `store=False`
 
 ---
 
@@ -589,8 +589,7 @@ With default settings (10-minute intervals, ~45 logs per run):
 
 ### Core Files (This Repository)
 
-- **`analyzer_fixed.py`** - Main AI analyzer service
-- **`deploy-log-analyzer.sh`** - Automated deployment script
+- **`deploy-log-analyzer.sh`** - Automated deployment script (contains all analyzer code)
 
 ### Created During Deployment
 

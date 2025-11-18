@@ -18,49 +18,118 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# Prompt for configuration
-echo -e "${YELLOW}Configuration Setup${NC}"
-echo ""
-read -p "Enter OpenAI API Key: " OPENAI_API_KEY
-read -p "Enter OpenAI Prompt ID (or leave empty to use inline prompt): " OPENAI_PROMPT_ID
-read -p "Enter Keep API URL [https://api.keephq-cjm9.consultic.tech/alerts/event]: " KEEP_URL
-KEEP_URL=${KEEP_URL:-https://api.keephq-cjm9.consultic.tech/alerts/event}
-read -p "Enter Keep API Key: " KEEP_API_KEY
-echo ""
-echo -e "${YELLOW}Detecting ClickHouse configuration...${NC}"
+# Check for existing .env file first
+mkdir -p /opt/log-analyzer
 
-# Auto-detect ClickHouse connection
-if docker ps --format '{{.Names}}\t{{.Ports}}' 2>/dev/null | grep clickhouse | grep -q "0.0.0.0:9000"; then
-    echo -e "${GREEN}✓ Found ClickHouse on localhost:9000 (port exposed)${NC}"
-    DEFAULT_CH_HOST="localhost"
-    DEFAULT_CH_PORT="9000"
-elif docker ps --format '{{.Names}}' 2>/dev/null | grep -q clickhouse; then
-    # Try to get IP from any network (custom networks have nested IPAddress)
-    CH_IP=$(docker inspect signoz-clickhouse 2>/dev/null | grep '"IPAddress"' | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | grep -v '^$' | head -1)
+if [ -f /opt/log-analyzer/.env ]; then
+    echo -e "${GREEN}✓ Found existing .env file. Loading configuration...${NC}"
+    # Source the .env file to load variables
+    set -a
+    source /opt/log-analyzer/.env
+    set +a
     
-    if [ -n "$CH_IP" ]; then
-        echo -e "${YELLOW}⚠ ClickHouse port not exposed, using container IP: $CH_IP${NC}"
-        echo -e "${YELLOW}  Consider exposing port 9000 in docker-compose.yaml for better reliability${NC}"
-        DEFAULT_CH_HOST="$CH_IP"
-        DEFAULT_CH_PORT="9000"
+    # Extract values (handle comments and empty lines)
+    OPENAI_API_KEY=${OPENAI_API_KEY:-}
+    OPENAI_PROMPT_ID=${OPENAI_PROMPT_ID:-}
+    OPENAI_PROMPT_VERSION=${OPENAI_PROMPT_VERSION:-}
+    KEEP_URL=${KEEP_URL:-}
+    KEEP_API_KEY=${KEEP_API_KEY:-}
+    CH_HOST=${CLICKHOUSE_HOST:-clickhouse}
+    CH_PORT=${CLICKHOUSE_PORT:-9000}
+    CH_DATABASE=${CLICKHOUSE_DATABASE:-signoz_logs}
+    INTERVAL_MINUTES=${ANALYSIS_INTERVAL_MINUTES:-${INTERVAL_MINUTES:-10}}
+    
+    echo -e "${GREEN}✓ Configuration loaded from existing .env file${NC}"
+    echo ""
+    echo "Current configuration:"
+    echo "  OpenAI Prompt ID: ${OPENAI_PROMPT_ID:-'(not set)'}"
+    echo "  OpenAI Prompt Version: ${OPENAI_PROMPT_VERSION:-'(not set)'}"
+    echo "  ClickHouse: ${CH_HOST}:${CH_PORT}"
+    echo "  Database: ${CH_DATABASE}"
+    echo "  Interval: ${INTERVAL_MINUTES} minutes"
+    echo ""
+    read -p "Do you want to update any values? (y/N): " UPDATE_CONFIG
+    if [ "$UPDATE_CONFIG" = "y" ] || [ "$UPDATE_CONFIG" = "Y" ]; then
+        SKIP_ENV_CREATE=false
     else
-        echo -e "${YELLOW}⚠ Could not auto-detect ClickHouse IP${NC}"
-        echo -e "${YELLOW}  Please check: docker inspect signoz-clickhouse | grep IPAddress${NC}"
+        SKIP_ENV_CREATE=true
+        # Still allow updating prompt version
+        read -p "Enter OpenAI Prompt Version to update (optional, press Enter to skip): " NEW_PROMPT_VERSION
+        if [ -n "$NEW_PROMPT_VERSION" ]; then
+            if grep -q "^OPENAI_PROMPT_VERSION=" /opt/log-analyzer/.env; then
+                sed -i "s/^OPENAI_PROMPT_VERSION=.*/OPENAI_PROMPT_VERSION=${NEW_PROMPT_VERSION}/" /opt/log-analyzer/.env
+            else
+                echo "OPENAI_PROMPT_VERSION=${NEW_PROMPT_VERSION}" >> /opt/log-analyzer/.env
+            fi
+            OPENAI_PROMPT_VERSION=$NEW_PROMPT_VERSION
+            echo -e "${GREEN}✓ Updated OPENAI_PROMPT_VERSION${NC}"
+        fi
+    fi
+else
+    echo -e "${YELLOW}No existing .env file found. Will prompt for configuration.${NC}"
+    SKIP_ENV_CREATE=false
+fi
+
+# Prompt for configuration only if .env doesn't exist or user wants to update
+if [ "$SKIP_ENV_CREATE" != "true" ]; then
+    echo ""
+    echo -e "${YELLOW}Configuration Setup${NC}"
+    echo ""
+    read -p "Enter OpenAI API Key${OPENAI_API_KEY:+ [current: ${OPENAI_API_KEY:0:10}...]}: " NEW_OPENAI_API_KEY
+    OPENAI_API_KEY=${NEW_OPENAI_API_KEY:-$OPENAI_API_KEY}
+    
+    read -p "Enter OpenAI Prompt ID${OPENAI_PROMPT_ID:+ [current: $OPENAI_PROMPT_ID]}: " NEW_OPENAI_PROMPT_ID
+    OPENAI_PROMPT_ID=${NEW_OPENAI_PROMPT_ID:-$OPENAI_PROMPT_ID}
+    
+    DEFAULT_KEEP_URL="https://api.keephq-cjm9.consultic.tech/alerts/event"
+    read -p "Enter Keep API URL${KEEP_URL:+ [current: $KEEP_URL]} [$DEFAULT_KEEP_URL]: " NEW_KEEP_URL
+    KEEP_URL=${NEW_KEEP_URL:-${KEEP_URL:-$DEFAULT_KEEP_URL}}
+    
+    read -p "Enter Keep API Key${KEEP_API_KEY:+ [current: ${KEEP_API_KEY:0:10}...]}: " NEW_KEEP_API_KEY
+    KEEP_API_KEY=${NEW_KEEP_API_KEY:-$KEEP_API_KEY}
+    
+    echo ""
+    echo -e "${YELLOW}Detecting ClickHouse configuration...${NC}"
+    
+    # Auto-detect ClickHouse connection
+    if docker ps --format '{{.Names}}\t{{.Ports}}' 2>/dev/null | grep clickhouse | grep -q "0.0.0.0:9000"; then
+        echo -e "${GREEN}✓ Found ClickHouse on localhost:9000 (port exposed)${NC}"
+        DEFAULT_CH_HOST="localhost"
+        DEFAULT_CH_PORT="9000"
+    elif docker ps --format '{{.Names}}' 2>/dev/null | grep -q clickhouse; then
+        # Try to get IP from any network (custom networks have nested IPAddress)
+        CH_IP=$(docker inspect signoz-clickhouse 2>/dev/null | grep '"IPAddress"' | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | grep -v '^$' | head -1)
+        
+        if [ -n "$CH_IP" ]; then
+            echo -e "${YELLOW}⚠ ClickHouse port not exposed, using container IP: $CH_IP${NC}"
+            echo -e "${YELLOW}  Consider exposing port 9000 in docker-compose.yaml for better reliability${NC}"
+            DEFAULT_CH_HOST="$CH_IP"
+            DEFAULT_CH_PORT="9000"
+        else
+            echo -e "${YELLOW}⚠ Could not auto-detect ClickHouse IP${NC}"
+            echo -e "${YELLOW}  Please check: docker inspect signoz-clickhouse | grep IPAddress${NC}"
+            DEFAULT_CH_HOST="localhost"
+            DEFAULT_CH_PORT="9000"
+        fi
+    else
+        echo -e "${YELLOW}⚠ ClickHouse container not found${NC}"
         DEFAULT_CH_HOST="localhost"
         DEFAULT_CH_PORT="9000"
     fi
-else
-    echo -e "${YELLOW}⚠ ClickHouse container not found${NC}"
-    DEFAULT_CH_HOST="localhost"
-    DEFAULT_CH_PORT="9000"
+    
+    DEFAULT_CH_HOST=${CH_HOST:-$DEFAULT_CH_HOST}
+    DEFAULT_CH_PORT=${CH_PORT:-$DEFAULT_CH_PORT}
+    read -p "Enter ClickHouse Host [$DEFAULT_CH_HOST]: " NEW_CH_HOST
+    CH_HOST=${NEW_CH_HOST:-$DEFAULT_CH_HOST}
+    read -p "Enter ClickHouse Port [$DEFAULT_CH_PORT]: " NEW_CH_PORT
+    CH_PORT=${NEW_CH_PORT:-$DEFAULT_CH_PORT}
+    
+    DEFAULT_INTERVAL=${INTERVAL_MINUTES:-10}
+    read -p "Enter Analysis Interval in Minutes [$DEFAULT_INTERVAL]: " NEW_INTERVAL_MINUTES
+    INTERVAL_MINUTES=${NEW_INTERVAL_MINUTES:-$DEFAULT_INTERVAL}
+    
+    CH_DATABASE=${CH_DATABASE:-signoz_logs}
 fi
-
-read -p "Enter ClickHouse Host [$DEFAULT_CH_HOST]: " CH_HOST
-CH_HOST=${CH_HOST:-$DEFAULT_CH_HOST}
-read -p "Enter ClickHouse Port [$DEFAULT_CH_PORT]: " CH_PORT
-CH_PORT=${CH_PORT:-$DEFAULT_CH_PORT}
-read -p "Enter Analysis Interval in Minutes [60]: " INTERVAL_MINUTES
-INTERVAL_MINUTES=${INTERVAL_MINUTES:-60}
 
 echo ""
 echo -e "${YELLOW}Step 1: Installing dependencies...${NC}"
@@ -88,37 +157,19 @@ echo -e "${GREEN}✓ Virtual environment ready${NC}"
 
 # Create configuration file
 echo ""
-echo -e "${YELLOW}Step 4: Creating configuration...${NC}"
-
-# Backup existing .env if it exists
-if [ -f /opt/log-analyzer/.env ]; then
-    BACKUP_FILE="/opt/log-analyzer/.env.backup.$(date +%Y%m%d_%H%M%S)"
-    echo -e "${YELLOW}⚠ Existing .env file found. Backing up to: ${BACKUP_FILE}${NC}"
-    cp /opt/log-analyzer/.env "$BACKUP_FILE"
-    echo -e "${GREEN}✓ Backup created${NC}"
-    echo ""
-    read -p "Do you want to overwrite the existing .env file? (y/N): " OVERWRITE_ENV
-    if [ "$OVERWRITE_ENV" != "y" ] && [ "$OVERWRITE_ENV" != "Y" ]; then
-        echo -e "${YELLOW}Skipping .env file creation. Using existing configuration.${NC}"
-        echo -e "${YELLOW}To restore backup later: cp $BACKUP_FILE /opt/log-analyzer/.env${NC}"
-        # Still prompt for version to add to existing file if needed
-        read -p "Enter OpenAI Prompt Version (optional, press Enter to skip): " OPENAI_PROMPT_VERSION
-        if [ -n "$OPENAI_PROMPT_VERSION" ]; then
-            # Update only the version line if it exists, or add it
-            if grep -q "^OPENAI_PROMPT_VERSION=" /opt/log-analyzer/.env; then
-                sed -i "s/^OPENAI_PROMPT_VERSION=.*/OPENAI_PROMPT_VERSION=${OPENAI_PROMPT_VERSION}/" /opt/log-analyzer/.env
-            else
-                echo "OPENAI_PROMPT_VERSION=${OPENAI_PROMPT_VERSION}" >> /opt/log-analyzer/.env
-            fi
-            echo -e "${GREEN}✓ Updated OPENAI_PROMPT_VERSION in existing .env${NC}"
-        fi
-        # Skip to next step
-        SKIP_ENV_CREATE=true
-    fi
-fi
+echo -e "${YELLOW}Step 4: Creating/updating configuration...${NC}"
 
 if [ "$SKIP_ENV_CREATE" != "true" ]; then
-    read -p "Enter OpenAI Prompt Version (optional, press Enter to skip): " OPENAI_PROMPT_VERSION
+    # Backup existing .env if it exists and we're about to overwrite
+    if [ -f /opt/log-analyzer/.env ]; then
+        BACKUP_FILE="/opt/log-analyzer/.env.backup.$(date +%Y%m%d_%H%M%S)"
+        echo -e "${YELLOW}⚠ Backing up existing .env to: ${BACKUP_FILE}${NC}"
+        cp /opt/log-analyzer/.env "$BACKUP_FILE"
+        echo -e "${GREEN}✓ Backup created${NC}"
+    fi
+    
+    read -p "Enter OpenAI Prompt Version (optional, press Enter to skip): " NEW_PROMPT_VERSION
+    OPENAI_PROMPT_VERSION=${NEW_PROMPT_VERSION:-$OPENAI_PROMPT_VERSION}
 
     cat > /opt/log-analyzer/.env << EOFENV
 # OpenAI Configuration
@@ -141,6 +192,8 @@ EOFENV
 
     chmod 600 /opt/log-analyzer/.env
     echo -e "${GREEN}✓ Configuration saved${NC}"
+else
+    echo -e "${GREEN}✓ Using existing .env configuration${NC}"
 fi
 
 # Create application file
@@ -157,6 +210,7 @@ Queries ClickHouse hourly, analyzes logs with OpenAI Agents, and reports to Keep
 import os
 import sys
 import json
+import socket
 import requests
 from datetime import datetime, timedelta
 from clickhouse_driver import Client
@@ -450,10 +504,14 @@ def send_to_keep(analysis, log_count, time_range_minutes):
     
     full_description = '\n'.join(description_parts)
     
+    # Get hostname for alert identification
+    hostname = socket.gethostname()
+    
     # Build Keep alert
+    analysis_summary = analysis.get('summary', 'System Analysis')[:80]
     keep_alert = {
         "id": f"ai-analysis-{int(datetime.utcnow().timestamp())}",
-        "name": f"AI Log Analysis: {analysis.get('summary', 'System Analysis')[:80]}",
+        "name": f"[{hostname}] AI Log Analysis: {analysis_summary}",
         "status": status,
         "severity": severity,
         "lastReceived": datetime.utcnow().isoformat() + 'Z',
