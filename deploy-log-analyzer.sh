@@ -90,10 +90,41 @@ echo -e "${GREEN}✓ Virtual environment ready${NC}"
 echo ""
 echo -e "${YELLOW}Step 4: Creating configuration...${NC}"
 
-cat > /opt/log-analyzer/.env << EOFENV
+# Backup existing .env if it exists
+if [ -f /opt/log-analyzer/.env ]; then
+    BACKUP_FILE="/opt/log-analyzer/.env.backup.$(date +%Y%m%d_%H%M%S)"
+    echo -e "${YELLOW}⚠ Existing .env file found. Backing up to: ${BACKUP_FILE}${NC}"
+    cp /opt/log-analyzer/.env "$BACKUP_FILE"
+    echo -e "${GREEN}✓ Backup created${NC}"
+    echo ""
+    read -p "Do you want to overwrite the existing .env file? (y/N): " OVERWRITE_ENV
+    if [ "$OVERWRITE_ENV" != "y" ] && [ "$OVERWRITE_ENV" != "Y" ]; then
+        echo -e "${YELLOW}Skipping .env file creation. Using existing configuration.${NC}"
+        echo -e "${YELLOW}To restore backup later: cp $BACKUP_FILE /opt/log-analyzer/.env${NC}"
+        # Still prompt for version to add to existing file if needed
+        read -p "Enter OpenAI Prompt Version (optional, press Enter to skip): " OPENAI_PROMPT_VERSION
+        if [ -n "$OPENAI_PROMPT_VERSION" ]; then
+            # Update only the version line if it exists, or add it
+            if grep -q "^OPENAI_PROMPT_VERSION=" /opt/log-analyzer/.env; then
+                sed -i "s/^OPENAI_PROMPT_VERSION=.*/OPENAI_PROMPT_VERSION=${OPENAI_PROMPT_VERSION}/" /opt/log-analyzer/.env
+            else
+                echo "OPENAI_PROMPT_VERSION=${OPENAI_PROMPT_VERSION}" >> /opt/log-analyzer/.env
+            fi
+            echo -e "${GREEN}✓ Updated OPENAI_PROMPT_VERSION in existing .env${NC}"
+        fi
+        # Skip to next step
+        SKIP_ENV_CREATE=true
+    fi
+fi
+
+if [ "$SKIP_ENV_CREATE" != "true" ]; then
+    read -p "Enter OpenAI Prompt Version (optional, press Enter to skip): " OPENAI_PROMPT_VERSION
+
+    cat > /opt/log-analyzer/.env << EOFENV
 # OpenAI Configuration
 OPENAI_API_KEY=${OPENAI_API_KEY}
 OPENAI_PROMPT_ID=${OPENAI_PROMPT_ID}
+OPENAI_PROMPT_VERSION=${OPENAI_PROMPT_VERSION}
 
 # Keep Configuration
 KEEP_URL=${KEEP_URL}
@@ -108,8 +139,9 @@ CLICKHOUSE_DATABASE=signoz_logs
 ANALYSIS_INTERVAL_MINUTES=${INTERVAL_MINUTES}
 EOFENV
 
-chmod 600 /opt/log-analyzer/.env
-echo -e "${GREEN}✓ Configuration saved${NC}"
+    chmod 600 /opt/log-analyzer/.env
+    echo -e "${GREEN}✓ Configuration saved${NC}"
+fi
 
 # Create application file
 echo ""
@@ -136,43 +168,14 @@ load_dotenv('/opt/log-analyzer/.env')
 
 # Configuration
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-OPENAI_PROMPT_ID = os.getenv('OPENAI_PROMPT_ID', '')
+OPENAI_PROMPT_ID = os.getenv('OPENAI_PROMPT_ID', '')  # Prompt ID from OpenAI platform
+OPENAI_PROMPT_VERSION = os.getenv('OPENAI_PROMPT_VERSION', '')  # Optional: prompt version
 KEEP_URL = os.getenv('KEEP_URL')
 KEEP_API_KEY = os.getenv('KEEP_API_KEY')
 CH_HOST = os.getenv('CLICKHOUSE_HOST', 'clickhouse')
 CH_PORT = int(os.getenv('CLICKHOUSE_PORT', '9000'))
 CH_DATABASE = os.getenv('CLICKHOUSE_DATABASE', 'signoz_logs')
-INTERVAL_MINUTES = int(os.getenv('ANALYSIS_INTERVAL_MINUTES', '60'))
-
-# System prompt for log analysis (used if no prompt_id)
-SYSTEM_PROMPT = """You are an expert log analyzer for production systems. 
-Analyze the provided logs and identify:
-1. Critical errors and failures
-2. Recurring patterns that indicate systemic issues
-3. Security concerns or anomalies
-4. Performance degradation indicators
-5. Any unusual or suspicious activity
-
-Provide a structured summary with:
-- Severity level (critical/high/warning/info)
-- Number of critical incidents
-- Top issues with counts
-- Recommended actions
-
-Format your response as JSON with this structure:
-{
-  "severity": "critical|high|warning|info",
-  "summary": "Brief overview",
-  "critical_count": 0,
-  "error_count": 0,
-  "warning_count": 0,
-  "top_issues": [
-    {"issue": "description", "count": 0, "severity": "critical|high|warning"}
-  ],
-  "recommendations": ["action 1", "action 2"],
-  "notable_events": ["event 1", "event 2"]
-}
-"""
+INTERVAL_MINUTES = int(os.getenv('ANALYSIS_INTERVAL_MINUTES', os.getenv('INTERVAL_MINUTES', '10')))
 
 def get_clickhouse_client():
     """Create ClickHouse client"""
@@ -204,9 +207,8 @@ def query_logs(client, lookback_minutes):
         severity_text,
         severity_number,
         body,
-        resources_string_key,
-        resources_string_value
-    FROM {CH_DATABASE}.logs
+        resources_string
+    FROM {CH_DATABASE}.logs_v2
     WHERE timestamp >= {start_ns} AND timestamp <= {end_ns}
     ORDER BY timestamp DESC
     LIMIT 10000
@@ -227,6 +229,11 @@ def format_logs_for_analysis(logs):
     if not logs:
         return "No logs found in the specified time range."
     
+    # Token limit: aim for ~30k tokens max (~120k characters)
+    # gpt-4o supports 128k tokens, but leave room for response
+    MAX_CHARS = 120000
+    MAX_BODY_LENGTH = 2000  # Reduced from 200 to fit more logs
+    
     formatted_lines = []
     formatted_lines.append(f"Log Analysis Report - {datetime.utcnow().isoformat()}")
     formatted_lines.append(f"Total Entries: {len(logs)}")
@@ -235,37 +242,8 @@ def format_logs_for_analysis(logs):
     
     # Group by severity
     severity_counts = {}
-    
     for log in logs:
-        timestamp, severity_text, severity_number, body, res_keys, res_values = log
-        
-        # Count by severity
-        severity_counts[severity_text] = severity_counts.get(severity_text, 0) + 1
-        
-        # Convert timestamp
-        try:
-            ts = datetime.fromtimestamp(timestamp / 1e9).strftime('%Y-%m-%d %H:%M:%S')
-        except:
-            ts = "unknown"
-        
-        # Parse resource attributes
-        host = "unknown"
-        service = "unknown"
-        if res_keys and res_values:
-            for i, key in enumerate(res_keys):
-                if key == 'host.name' and i < len(res_values):
-                    host = res_values[i]
-                elif key == 'service.name' and i < len(res_values):
-                    service = res_values[i]
-        
-        # Format body
-        body_str = str(body)
-        if len(body_str) > 200:
-            body_str = body_str[:200] + "..."
-        
-        formatted_lines.append(f"[{ts}] {severity_text} | {host} | {service}")
-        formatted_lines.append(f"  {body_str}")
-        formatted_lines.append("")
+        severity_counts[log[1]] = severity_counts.get(log[1], 0) + 1
     
     # Add summary at the top
     summary_lines = ["", "Severity Summary:"]
@@ -277,53 +255,117 @@ def format_logs_for_analysis(logs):
     # Insert summary after header
     formatted_lines[4:4] = summary_lines
     
-    return "\n".join(formatted_lines)
+    # Format logs with size tracking
+    current_size = len("\n".join(formatted_lines))
+    logs_added = 0
+    logs_skipped = 0
+    
+    for log in logs:
+        timestamp, severity_text, severity_number, body, resources_string = log
+        
+        # Convert timestamp
+        try:
+            ts = datetime.fromtimestamp(timestamp / 1e9).strftime('%Y-%m-%d %H:%M:%S')
+        except:
+            ts = "unknown"
+        
+        # Parse resource attributes
+        host = "unknown"
+        service = "unknown"
+        if resources_string and isinstance(resources_string, dict):
+            host = resources_string.get('host.name', 'unknown')
+            service = resources_string.get('service.name', 'unknown')
+        
+        # Format body
+        body_str = str(body)
+        if len(body_str) > MAX_BODY_LENGTH:
+            body_str = body_str[:MAX_BODY_LENGTH] + "..."
+        
+        # Build log entry
+        log_entry = f"[{ts}] {severity_text} | {host} | {service}\n  {body_str}\n"
+        
+        # Check if adding this log would exceed limit
+        if current_size + len(log_entry) > MAX_CHARS:
+            logs_skipped += 1
+            continue
+        
+        formatted_lines.append(f"[{ts}] {severity_text} | {host} | {service}")
+        formatted_lines.append(f"  {body_str}")
+        formatted_lines.append("")
+        current_size += len(log_entry)
+        logs_added += 1
+    
+    # Add truncation notice if needed
+    if logs_skipped > 0:
+        formatted_lines.append("")
+        formatted_lines.append(f"[NOTE: {logs_skipped} additional log entries omitted due to size limits]")
+        formatted_lines.append(f"[Showing {logs_added} of {len(logs)} total entries]")
+    
+    result = "\n".join(formatted_lines)
+    print(f"[DEBUG] Formatted logs: {len(result)} characters, {logs_added} logs included, {logs_skipped} skipped")
+    
+    return result
 
 def analyze_with_openai(log_text):
-    """Send logs to OpenAI for analysis"""
+    """Send logs to OpenAI for analysis using Responses API"""
     
     try:
         client = OpenAI(api_key=OPENAI_API_KEY)
         
         print(f"[INFO] Sending {len(log_text)} characters to OpenAI for analysis")
+        print(f"[INFO] Using Responses API with platform prompt ID: {OPENAI_PROMPT_ID}")
         
-        # Build messages based on whether Prompt ID is provided
-        if OPENAI_PROMPT_ID:
-            # Using platform-side prompt - send only user message
-            print(f"[INFO] Using OpenAI platform prompt (ID: {OPENAI_PROMPT_ID})")
-            print("[INFO] No system prompt in API call - managed on platform side")
-            
-            messages = [
-                {
-                    "role": "user",
-                    "content": log_text
+        # Build prompt parameter
+        prompt_config = {"id": OPENAI_PROMPT_ID}
+        if OPENAI_PROMPT_VERSION:
+            prompt_config["version"] = OPENAI_PROMPT_VERSION
+        
+        # When using json_object format, input must contain the word "json"
+        # Add a simple prefix to satisfy this requirement
+        input_with_json_hint = f"Analyze and return JSON:\n\n{log_text}"
+        
+        # Log request details
+        print(f"[DEBUG] ======== OpenAI Request ========")
+        print(f"[DEBUG] URL: https://api.openai.com/v1/responses")
+        print(f"[DEBUG] Method: POST")
+        print(f"[DEBUG] Payload:")
+        print(f"[DEBUG]   prompt.id: {OPENAI_PROMPT_ID}")
+        if OPENAI_PROMPT_VERSION:
+            print(f"[DEBUG]   prompt.version: {OPENAI_PROMPT_VERSION}")
+        print(f"[DEBUG]   input: (length={len(input_with_json_hint)}) '{input_with_json_hint[:200]}...'")
+        print(f"[DEBUG]   text.format.type: json_object")
+        print(f"[DEBUG]   store: True")
+        
+        print(f"[DEBUG] Making API call to OpenAI...")
+        response = client.responses.create(
+            prompt=prompt_config,
+            input=input_with_json_hint,
+            text={
+                "format": {
+                    "type": "json_object"
                 }
-            ]
-            
-            # Note: If using Assistants API or fine-tuned models,
-            # you may need to use a different endpoint or pass the prompt ID differently
-            # This assumes the prompt is configured in your OpenAI project settings
-            
-        else:
-            # No Prompt ID - use inline system prompt as fallback
-            print("[INFO] Using inline system prompt (no Prompt ID provided)")
-            
-            messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": log_text}
-            ]
-        
-        # Make API call
-        response = client.chat.completions.create(
-            model="gpt-4o",  # or gpt-4-turbo, gpt-3.5-turbo
-            messages=messages,
-            temperature=0.3,
-            max_tokens=2000,
-            response_format={"type": "json_object"}
+            },
+            store=True  # Store to see in OpenAI platform
         )
         
-        analysis = response.choices[0].message.content
-        print("[INFO] Received analysis from OpenAI")
+        # Log response details
+        print(f"[DEBUG] ======== OpenAI Response ========")
+        print(f"[DEBUG] Response ID: {response.id}")
+        print(f"[DEBUG] Status: {response.status}")
+        print(f"[DEBUG] Model: {response.model}")
+        print(f"[DEBUG] Created: {response.created_at}")
+        
+        # Log usage if available
+        if hasattr(response, 'usage') and response.usage:
+            print(f"[DEBUG] Usage: {response.usage}")
+        
+        # Extract output from Responses API
+        # Use the output_text helper for easy access
+        analysis = response.output_text
+        
+        print(f"[DEBUG] Output text length: {len(analysis)} characters")
+        print(f"[DEBUG] Output text (full): {analysis}")
+        print(f"[INFO] Received analysis from OpenAI Responses API")
         
         # Parse JSON response
         try:
@@ -331,6 +373,7 @@ def analyze_with_openai(log_text):
             return analysis_data
         except json.JSONDecodeError:
             # If not valid JSON, wrap it
+            print("[WARN] Response was not valid JSON, wrapping...")
             return {
                 "severity": "info",
                 "summary": analysis,
