@@ -38,6 +38,7 @@ if [ -f /opt/log-analyzer/.env ]; then
     CH_PORT=${CLICKHOUSE_PORT:-9000}
     CH_DATABASE=${CLICKHOUSE_DATABASE:-signoz_logs}
     INTERVAL_MINUTES=${ANALYSIS_INTERVAL_MINUTES:-${INTERVAL_MINUTES:-10}}
+    MIN_LOG_SEVERITY=${MIN_LOG_SEVERITY:-13}
     
     echo -e "${GREEN}✓ Configuration loaded from existing .env file${NC}"
     echo ""
@@ -47,6 +48,7 @@ if [ -f /opt/log-analyzer/.env ]; then
     echo "  ClickHouse: ${CH_HOST}:${CH_PORT}"
     echo "  Database: ${CH_DATABASE}"
     echo "  Interval: ${INTERVAL_MINUTES} minutes"
+    echo "  Min Log Severity: ${MIN_LOG_SEVERITY} (13=WARN, 17=ERROR, 21=FATAL)"
     echo ""
     read -p "Do you want to update any values? (y/N): " UPDATE_CONFIG
     if [ "$UPDATE_CONFIG" = "y" ] || [ "$UPDATE_CONFIG" = "Y" ]; then
@@ -63,6 +65,11 @@ if [ -f /opt/log-analyzer/.env ]; then
             fi
             OPENAI_PROMPT_VERSION=$NEW_PROMPT_VERSION
             echo -e "${GREEN}✓ Updated OPENAI_PROMPT_VERSION${NC}"
+        fi
+        # Ensure MIN_LOG_SEVERITY exists in .env (add if missing)
+        if ! grep -q "^MIN_LOG_SEVERITY=" /opt/log-analyzer/.env; then
+            echo "MIN_LOG_SEVERITY=${MIN_LOG_SEVERITY:-13}" >> /opt/log-analyzer/.env
+            echo -e "${GREEN}✓ Added MIN_LOG_SEVERITY to .env${NC}"
         fi
     fi
 else
@@ -128,6 +135,14 @@ if [ "$SKIP_ENV_CREATE" != "true" ]; then
     read -p "Enter Analysis Interval in Minutes [$DEFAULT_INTERVAL]: " NEW_INTERVAL_MINUTES
     INTERVAL_MINUTES=${NEW_INTERVAL_MINUTES:-$DEFAULT_INTERVAL}
     
+    DEFAULT_MIN_SEVERITY=${MIN_LOG_SEVERITY:-13}
+    echo ""
+    echo "Log Severity Levels:"
+    echo "  1-4 = TRACE, 5-8 = DEBUG, 9-12 = INFO"
+    echo "  13-16 = WARN, 17-20 = ERROR, 21-24 = FATAL"
+    read -p "Enter Minimum Log Severity (13=WARN, 17=ERROR, 21=FATAL) [$DEFAULT_MIN_SEVERITY]: " NEW_MIN_SEVERITY
+    MIN_LOG_SEVERITY=${NEW_MIN_SEVERITY:-$DEFAULT_MIN_SEVERITY}
+    
     CH_DATABASE=${CH_DATABASE:-signoz_logs}
 fi
 
@@ -188,6 +203,7 @@ CLICKHOUSE_DATABASE=signoz_logs
 
 # Analysis Configuration
 ANALYSIS_INTERVAL_MINUTES=${INTERVAL_MINUTES}
+MIN_LOG_SEVERITY=${MIN_LOG_SEVERITY:-13}
 EOFENV
 
     chmod 600 /opt/log-analyzer/.env
@@ -230,6 +246,7 @@ CH_HOST = os.getenv('CLICKHOUSE_HOST', 'clickhouse')
 CH_PORT = int(os.getenv('CLICKHOUSE_PORT', '9000'))
 CH_DATABASE = os.getenv('CLICKHOUSE_DATABASE', 'signoz_logs')
 INTERVAL_MINUTES = int(os.getenv('ANALYSIS_INTERVAL_MINUTES', os.getenv('INTERVAL_MINUTES', '10')))
+MIN_LOG_SEVERITY = int(os.getenv('MIN_LOG_SEVERITY', '13'))
 
 def get_clickhouse_client():
     """Create ClickHouse client"""
@@ -255,6 +272,8 @@ def query_logs(client, lookback_minutes):
     start_ns = int(start_time.timestamp() * 1e9)
     end_ns = int(end_time.timestamp() * 1e9)
     
+    # Filter by minimum severity level (from .env)
+    # TRACE=1-4, DEBUG=5-8, INFO=9-12, WARN=13-16, ERROR=17-20, FATAL=21-24
     query = f"""
     SELECT 
         timestamp,
@@ -264,14 +283,17 @@ def query_logs(client, lookback_minutes):
         resources_string
     FROM {CH_DATABASE}.logs_v2
     WHERE timestamp >= {start_ns} AND timestamp <= {end_ns}
+      AND severity_number >= {MIN_LOG_SEVERITY}
     ORDER BY timestamp DESC
     LIMIT 10000
     """
     
     try:
-        print(f"[INFO] Querying logs from {start_time} to {end_time}")
+        severity_names = {13: "WARN", 17: "ERROR", 21: "FATAL"}
+        severity_name = severity_names.get(MIN_LOG_SEVERITY, f"severity>={MIN_LOG_SEVERITY}")
+        print(f"[INFO] Querying logs from {start_time} to {end_time} (severity >= {MIN_LOG_SEVERITY} ({severity_name} and above))")
         result = client.execute(query)
-        print(f"[INFO] Retrieved {len(result)} log entries")
+        print(f"[INFO] Retrieved {len(result)} log entries with severity >= {MIN_LOG_SEVERITY}")
         return result
     except Exception as e:
         print(f"[ERROR] Failed to query logs: {e}")
@@ -567,8 +589,10 @@ def main():
     client = get_clickhouse_client()
     print("[SUCCESS] Connected to ClickHouse")
     
-    # Step 2: Query logs
-    print(f"[2/4] Querying logs for last {INTERVAL_MINUTES} minutes...")
+    # Step 2: Query logs (filtered by minimum severity)
+    severity_names = {13: "WARN", 17: "ERROR", 21: "FATAL"}
+    severity_name = severity_names.get(MIN_LOG_SEVERITY, f"severity>={MIN_LOG_SEVERITY}")
+    print(f"[2/4] Querying logs (severity >= {MIN_LOG_SEVERITY} - {severity_name} and above) for last {INTERVAL_MINUTES} minutes...")
     logs = query_logs(client, INTERVAL_MINUTES)
     
     if not logs or len(logs) == 0:
