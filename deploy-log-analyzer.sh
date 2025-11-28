@@ -488,9 +488,8 @@ def send_to_keep(analysis, log_count, time_range_minutes):
         status = 'resolved'
     
     # Build description
+    # Note: OpenAI summary already includes "AI Analysis Summary (Last X minutes):" prefix
     description_parts = [
-        f"AI Analysis Summary (Last {time_range_minutes} minutes):",
-        "",
         analysis.get('summary', 'No summary provided'),
         "",
         f"Metrics:",
