@@ -39,6 +39,7 @@ if [ -f /opt/log-analyzer/.env ]; then
     CH_DATABASE=${CLICKHOUSE_DATABASE:-signoz_logs}
     INTERVAL_MINUTES=${ANALYSIS_INTERVAL_MINUTES:-${INTERVAL_MINUTES:-10}}
     MIN_LOG_SEVERITY=${MIN_LOG_SEVERITY:-13}
+    OS_TYPE=${OS_TYPE:-}
     
     echo -e "${GREEN}✓ Configuration loaded from existing .env file${NC}"
     echo ""
@@ -49,6 +50,7 @@ if [ -f /opt/log-analyzer/.env ]; then
     echo "  Database: ${CH_DATABASE}"
     echo "  Interval: ${INTERVAL_MINUTES} minutes"
     echo "  Min Log Severity: ${MIN_LOG_SEVERITY} (13=WARN, 17=ERROR, 21=FATAL)"
+    echo "  OS Type Filter: ${OS_TYPE:-'(all - no filter)'}"
     echo ""
     read -p "Do you want to update any values? (y/N): " UPDATE_CONFIG
     if [ "$UPDATE_CONFIG" = "y" ] || [ "$UPDATE_CONFIG" = "Y" ]; then
@@ -143,6 +145,19 @@ if [ "$SKIP_ENV_CREATE" != "true" ]; then
     read -p "Enter Minimum Log Severity (13=WARN, 17=ERROR, 21=FATAL) [$DEFAULT_MIN_SEVERITY]: " NEW_MIN_SEVERITY
     MIN_LOG_SEVERITY=${NEW_MIN_SEVERITY:-$DEFAULT_MIN_SEVERITY}
     
+    echo ""
+    echo "OS Type Filter:"
+    echo "  Leave empty to analyze all OS types"
+    echo "  Enter 'windows' to filter Windows events only"
+    echo "  Enter 'linux' to filter Linux events only"
+    DEFAULT_OS_TYPE=${OS_TYPE:-}
+    read -p "Enter OS Type Filter (windows/linux/empty for all)${OS_TYPE:+ [current: $OS_TYPE]} [${DEFAULT_OS_TYPE:-empty}]: " NEW_OS_TYPE
+    OS_TYPE=${NEW_OS_TYPE:-$DEFAULT_OS_TYPE}
+    # Normalize: convert to lowercase and handle empty
+    if [ -n "$OS_TYPE" ]; then
+        OS_TYPE=$(echo "$OS_TYPE" | tr '[:upper:]' '[:lower:]')
+    fi
+    
     CH_DATABASE=${CH_DATABASE:-signoz_logs}
 fi
 
@@ -204,6 +219,7 @@ CLICKHOUSE_DATABASE=signoz_logs
 # Analysis Configuration
 ANALYSIS_INTERVAL_MINUTES=${INTERVAL_MINUTES}
 MIN_LOG_SEVERITY=${MIN_LOG_SEVERITY:-13}
+OS_TYPE=${OS_TYPE:-}
 EOFENV
 
     chmod 600 /opt/log-analyzer/.env
@@ -247,6 +263,7 @@ CH_PORT = int(os.getenv('CLICKHOUSE_PORT', '9000'))
 CH_DATABASE = os.getenv('CLICKHOUSE_DATABASE', 'signoz_logs')
 INTERVAL_MINUTES = int(os.getenv('ANALYSIS_INTERVAL_MINUTES', os.getenv('INTERVAL_MINUTES', '10')))
 MIN_LOG_SEVERITY = int(os.getenv('MIN_LOG_SEVERITY', '13'))
+OS_TYPE = os.getenv('OS_TYPE', '').lower().strip() if os.getenv('OS_TYPE') else ''
 
 def get_clickhouse_client():
     """Create ClickHouse client"""
@@ -274,6 +291,24 @@ def query_logs(client, lookback_minutes):
     
     # Filter by minimum severity level (from .env)
     # TRACE=1-4, DEBUG=5-8, INFO=9-12, WARN=13-16, ERROR=17-20, FATAL=21-24
+    # Build WHERE clause
+    where_conditions = [
+        f"timestamp >= {start_ns}",
+        f"timestamp <= {end_ns}",
+        f"severity_number >= {MIN_LOG_SEVERITY}"
+    ]
+    
+    # Add OS type filter if specified
+    os_filter_msg = ""
+    if OS_TYPE:
+        # ClickHouse resources_string is typically a Map(String, String)
+        # Filter by os.type from resources
+        # Handle case where resources_string might be NULL or key doesn't exist
+        where_conditions.append(f"has(resources_string, 'os.type') AND resources_string['os.type'] = '{OS_TYPE}'")
+        os_filter_msg = f", os.type = {OS_TYPE}"
+    
+    where_clause = " AND ".join(where_conditions)
+    
     query = f"""
     SELECT 
         timestamp,
@@ -282,8 +317,7 @@ def query_logs(client, lookback_minutes):
         body,
         resources_string
     FROM {CH_DATABASE}.logs_v2
-    WHERE timestamp >= {start_ns} AND timestamp <= {end_ns}
-      AND severity_number >= {MIN_LOG_SEVERITY}
+    WHERE {where_clause}
     ORDER BY timestamp DESC
     LIMIT 10000
     """
@@ -291,9 +325,10 @@ def query_logs(client, lookback_minutes):
     try:
         severity_names = {13: "WARN", 17: "ERROR", 21: "FATAL"}
         severity_name = severity_names.get(MIN_LOG_SEVERITY, f"severity>={MIN_LOG_SEVERITY}")
-        print(f"[INFO] Querying logs from {start_time} to {end_time} (severity >= {MIN_LOG_SEVERITY} ({severity_name} and above))")
+        filter_msg = f"severity >= {MIN_LOG_SEVERITY} ({severity_name} and above){os_filter_msg}"
+        print(f"[INFO] Querying logs from {start_time} to {end_time} ({filter_msg})")
         result = client.execute(query)
-        print(f"[INFO] Retrieved {len(result)} log entries with severity >= {MIN_LOG_SEVERITY}")
+        print(f"[INFO] Retrieved {len(result)} log entries with {filter_msg}")
         return result
     except Exception as e:
         print(f"[ERROR] Failed to query logs: {e}")
@@ -588,10 +623,11 @@ def main():
     client = get_clickhouse_client()
     print("[SUCCESS] Connected to ClickHouse")
     
-    # Step 2: Query logs (filtered by minimum severity)
+    # Step 2: Query logs (filtered by minimum severity and OS type)
     severity_names = {13: "WARN", 17: "ERROR", 21: "FATAL"}
     severity_name = severity_names.get(MIN_LOG_SEVERITY, f"severity>={MIN_LOG_SEVERITY}")
-    print(f"[2/4] Querying logs (severity >= {MIN_LOG_SEVERITY} - {severity_name} and above) for last {INTERVAL_MINUTES} minutes...")
+    os_filter_info = f", os.type = {OS_TYPE}" if OS_TYPE else ""
+    print(f"[2/4] Querying logs (severity >= {MIN_LOG_SEVERITY} - {severity_name} and above{os_filter_info}) for last {INTERVAL_MINUTES} minutes...")
     logs = query_logs(client, INTERVAL_MINUTES)
     
     if not logs or len(logs) == 0:
@@ -772,6 +808,7 @@ echo "  Interval: Every ${INTERVAL_MINUTES} minutes"
 echo "  ClickHouse: ${CH_HOST}:${CH_PORT}"
 echo "  Keep Endpoint: ${KEEP_URL}"
 echo "  OpenAI Prompt ID: ${OPENAI_PROMPT_ID:-"(using inline prompt)"}"
+echo "  OS Type Filter: ${OS_TYPE:-"(all - no filter)"}"
 echo ""
 echo "Useful Commands:"
 echo "  View timer status: systemctl status log-analyzer.timer"
