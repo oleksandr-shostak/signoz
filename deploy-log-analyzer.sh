@@ -90,9 +90,8 @@ if [ "$SKIP_ENV_CREATE" != "true" ]; then
     read -p "Enter OpenAI Prompt ID${OPENAI_PROMPT_ID:+ [current: $OPENAI_PROMPT_ID]}: " NEW_OPENAI_PROMPT_ID
     OPENAI_PROMPT_ID=${NEW_OPENAI_PROMPT_ID:-$OPENAI_PROMPT_ID}
     
-    DEFAULT_KEEP_URL="https://api.keephq-cjm9.consultic.tech/alerts/event"
-    read -p "Enter Keep API URL${KEEP_URL:+ [current: $KEEP_URL]} [$DEFAULT_KEEP_URL]: " NEW_KEEP_URL
-    KEEP_URL=${NEW_KEEP_URL:-${KEEP_URL:-$DEFAULT_KEEP_URL}}
+    read -p "Enter Keep API URL${KEEP_URL:+ [current: $KEEP_URL]}: " NEW_KEEP_URL
+    KEEP_URL=${NEW_KEEP_URL:-$KEEP_URL}
     
     read -p "Enter Keep API Key${KEEP_API_KEY:+ [current: ${KEEP_API_KEY:0:10}...]}: " NEW_KEEP_API_KEY
     KEEP_API_KEY=${NEW_KEEP_API_KEY:-$KEEP_API_KEY}
